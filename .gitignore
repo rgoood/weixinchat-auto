@@ -1,0 +1,9 @@
+# 敏感文件，禁止提交
+config.json
+wxreply.log
+*.log
+
+# Python
+.venv/
+__pycache__/
+*.pyc

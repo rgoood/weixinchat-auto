@@ -7,3 +7,5 @@ wxreply.log
 .venv/
 __pycache__/
 *.pyc
+
+wechatauto_logs/

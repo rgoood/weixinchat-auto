@@ -21,12 +21,16 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 LOG_FILE = os.path.join(BASE_DIR, "wxreply.log")
 
 # ============ 行为配置 ============
-WHITELIST = []          # 只回复这些人（昵称/备注），留空 = 所有私聊
-IGNORE_GROUPS = True    # 群聊不自动回（推荐）
-REPLY_DELAY = (3, 8)    # 回复前随机延迟（秒）
-COOLDOWN = 5            # 同一联系人回复最小间隔（秒）
-POLL_INTERVAL = 2       # 会话表轮询间隔（秒）
+WHITELIST = []          # 只回复这些人（昵称/备注/群名），留空 = 不限制
+IGNORE_GROUPS = False   # False=回复群聊；True=只回私聊
+GROUP_REQUIRE_AT = False  # True=群里仅当有人 @你 时才回（更安全，需消息里带 @）
+REPLY_DELAY = (0.2, 0.6)  # 回复前短延迟（秒）；原先 3~8s 太慢
+COOLDOWN = 1.0          # 同一联系人/群回复最小间隔（秒）
+POLL_INTERVAL = 1       # 会话表轮询间隔（秒）
 # =================================
+
+# 显示名缓存：wxid -> 备注/昵称（UI 搜索/复用会话必须用显示名，不能用 wxid）
+_name_cache = {}
 
 # 日志双写：控制台 + 文件
 class _Tee:
@@ -77,10 +81,36 @@ def is_system_chat(username: str) -> bool:
         return True
     if username.startswith("gh_"):            # 公众号
         return True
-    for suf in ("@chatroom", "@openim", "@weclaw", "@im.wechat", "@chatbot"):
+    # 群聊由 IGNORE_GROUPS 控制，不要在这里一律拦截 @chatroom
+    for suf in ("@openim", "@weclaw", "@im.wechat", "@chatbot"):
         if username.endswith(suf):
             return True
     return False
+
+
+def is_group(username: str) -> bool:
+    return username.endswith("@chatroom")
+
+
+def display_name(db, username: str) -> str:
+    """wxid → 备注/昵称；UI 复用会话依赖显示名。"""
+    cached = _name_cache.get(username)
+    if cached:
+        return cached
+    try:
+        name = (db.get_nickname(username) or "").strip() or username
+    except Exception:
+        name = username
+    _name_cache[username] = name
+    return name
+
+
+def same_chat(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return (len(a) >= 2 and a in b) or (len(b) >= 2 and b in a)
 
 
 def ai_reply(user: str, text: str) -> str:
@@ -90,9 +120,15 @@ def ai_reply(user: str, text: str) -> str:
     messages.extend(hist)
     messages.append({"role": "user", "content": text})
     try:
+        t0 = time.time()
         resp = ai_client.chat.completions.create(
-            model=AI_MODEL, messages=messages, max_tokens=500, timeout=60)
-        reply = (resp.choices[0].message.content or "").strip()
+            model=AI_MODEL, messages=messages, max_tokens=512, timeout=45)
+        msg = resp.choices[0].message
+        reply = (msg.content or "").strip()
+        # 墨点 DeepSeek 等推理模型可能把长度耗在 reasoning 上，正文为空时兜底
+        if not reply:
+            reply = (getattr(msg, "reasoning_content", None) or "").strip()
+        print(f"[AI耗时] {time.time() - t0:.1f}s")
     except Exception as e:
         print(f"[AI失败] {type(e).__name__}: {str(e)[:120]}")
         return ""
@@ -106,7 +142,36 @@ def ai_reply(user: str, text: str) -> str:
     return reply
 
 
-def process(db, guia_send, username: str, msgs: list, last_ts_map: dict):
+def send_reply(wx, who: str, text: str):
+    """复用同一个 WeChatGUI；同会话已打开时不再搜索。"""
+    uia = None
+    try:
+        uia = wx._get_uia()
+    except Exception:
+        uia = None
+    cur = None
+    if uia is not None:
+        try:
+            cur = uia.current_chat()
+        except Exception:
+            cur = None
+    # 当前窗口已是目标会话：直接发，跳过 open_chat / 搜索
+    if same_chat(cur, who) or same_chat(getattr(wx, "_current_chat", None), who):
+        t0 = time.time()
+        if uia is not None and uia.send_text(text):
+            wx._current_chat = who
+            print(f"[发送] 复用当前会话，耗时 {time.time() - t0:.1f}s")
+            return
+        # UIA 直发失败再走完整 send_msg（仍带 who，便于库内复用）
+    t0 = time.time()
+    resp = wx.send_msg(text, who, verify=False)
+    ok = bool(resp)  # WxResponse.__bool__ / is_success
+    print(f"[发送] {'OK' if ok else resp}，耗时 {time.time() - t0:.1f}s")
+    if not ok:
+        raise RuntimeError(str(resp))
+
+
+def process(db, wx, username: str, msgs: list, last_ts_map: dict):
     """处理某会话的新消息（取最后一条文本触发回复）。"""
     now = time.time()
     if now - _last_reply.get(username, 0) < COOLDOWN:
@@ -123,37 +188,45 @@ def process(db, guia_send, username: str, msgs: list, last_ts_map: dict):
             target = content
     if not target:
         return
-    if WHITELIST and username not in WHITELIST:
+    who = display_name(db, username)
+    if WHITELIST and who not in WHITELIST and username not in WHITELIST:
         return
-    print(f"[收到] {username[:22]}: {target[:50]}")
-    time.sleep(random.uniform(*REPLY_DELAY))
+    if is_group(username) and GROUP_REQUIRE_AT:
+        # 粗判：消息含 @ 才回（微信群 @ 文案因版本略有差异）
+        if "@" not in target and "＠" not in target:
+            return
+    print(f"[收到] {who}: {target[:50]}")
+    # 先打 AI，再短延迟发送（以前是先睡 3~8 秒再请求，体感很慢）
     reply = ai_reply(username, target)
     if not reply:
         return
+    time.sleep(random.uniform(*REPLY_DELAY))
     try:
-        guia_send(reply, username)
+        send_reply(wx, who, reply)
         _last_reply[username] = time.time()
-        print(f"[回复] {username[:22]}: {reply[:50]}")
+        print(f"[回复] {who}: {reply[:50]}")
     except Exception as e:
         print(f"[发送失败] {type(e).__name__}: {str(e)[:150]}")
 
 
 def main():
     from wechatauto import WeChatDB
-    from wechatauto.guia import quick_send
+    from wechatauto.guia import WeChatGUI
 
     print("=" * 56)
-    print("  微信个人号 AI 自动回复 v2（会话表轮询版）")
+    print("  微信个人号 AI 自动回复 v2.1（会话复用 / 加速）")
     print(f"  模型: {AI_MODEL}")
-    print(f"  群聊: {'不回' if IGNORE_GROUPS else '回复'} | 白名单: {'全部私聊' if not WHITELIST else WHITELIST}")
+    print(f"  群聊: {'不回' if IGNORE_GROUPS else ('仅@才回' if GROUP_REQUIRE_AT else '回复')} | 白名单: {'不限制' if not WHITELIST else WHITELIST}")
     print("=" * 56)
 
     db = WeChatDB()
+    # 全程复用同一个 GUI：同会话第二次回复可走快速路径，不再重新搜索
+    wx = WeChatGUI()
     # 记录每个会话已知的 last_time；首轮全部视为已读（只回启动后的新消息）
     known = {}
     for s in db.get_sessions(limit=500):
         known[s["username"]] = s.get("last_time") or 0
-    print(f"[运行中] 初始 {len(known)} 个会话，每 {POLL_INTERVAL}s 扫一次会话表。Ctrl+C 停止")
+    print(f"[运行中] 初始 {len(known)} 个会话，每 {POLL_INTERVAL}s 扫一次。Ctrl+C 停止")
 
     while True:
         try:
@@ -186,7 +259,7 @@ def main():
                         _seen.add(key)
                         fresh.append(m)
                     if fresh:
-                        process(db, quick_send, u, fresh, known)
+                        process(db, wx, u, fresh, known)
         except Exception as e:
             print(f"[轮询异常] {type(e).__name__}: {str(e)[:120]}")
         time.sleep(POLL_INTERVAL)

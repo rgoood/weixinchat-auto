@@ -1,0 +1,14 @@
+weixinchat-auto 已安装
+
+目录: C:\Users\EDY\Desktop\work\weixinchat-auto
+Python: 3.12（.venv，因 winsdk 仅有 3.12 预编译包）
+
+使用前:
+1. 编辑 config.json，把 api_key 换成你的 OpenAI 兼容 Key
+   （默认 base_url 是 https://openrouter.ai/api/v1，也可改成 DeepSeek 等）
+2. 登录 PC 微信 4.1.12+，窗口保持打开（不要最小化到托盘）
+3. 双击 start_wxauto.bat 启动
+   或命令行: .venv\Scripts\python.exe -X utf8 wechat_ai_reply.py
+
+建议先在 wechat_ai_reply.py 里设 WHITELIST 只测 1-2 个好友，
+群聊保持 IGNORE_GROUPS = True。
